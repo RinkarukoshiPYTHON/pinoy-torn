@@ -6745,5 +6745,103 @@ logout = function(){
 };
 if(S) render();
 </script>
+<script>
+/* =====================================================================
+   v38 — LOCAL SAVE (ayaw nang mawala ang progress)
+   - Bakit: dati, bawat login ay S = freshState(...) — Level 1, ₱500 —
+     at walang kahit isang localStorage save ng S. Kaya pag ni-reload,
+     isinara, o na-logout, balik sa simula ang lahat ng laro (krimen,
+     gym, trabaho, casino, items). Ang server ay may saveDb() sa bawat
+     action, pero ang client ay hindi tumatawag sa /api/crimes, /api/gym
+     atbp. — auth, players, leaderboard, chat at trade lang ang live.
+     Kaya ang tunay na progress ay nasa memory lang ng page.
+   - Ayos: bawat render (bawat galaw) ay nagse-save ng S sa
+     localStorage ('pt_save_v1:<username>', sariling key bawat account,
+     max 1x kada 2 segundo), pati sa logout at pagehide. Pag-login ulit,
+     ibinabalik ang save sa halip na fresh state — pero HINDI pag bagong
+     character creation (CHAR_PENDING), para laging simula ang bago.
+   - Tandaan: per-device lang ito (sa phone mo naka-save). Ang tunay na
+     pangmatagalang ayos ay ang server na mismo ang mag-save ng bawat
+     galaw — susunod na hakbang iyon, hindi kasama dito.
+===================================================================== */
+var PT_SAVE_PREFIX = 'pt_save_v1:';
+var PT_SAVE_LAST = 0;
+function ptSaveKey(owner){ return PT_SAVE_PREFIX + ('' + owner).toLowerCase(); }
+function ptSaveOwner(){
+  /* S.username muna: siya ang may-ari ng state na naka-load ngayon.
+     PT_ACCOUNT ay fallback lang — baka iba na ito pag nagpalit ng
+     account bago mag-logout, at ayaw nating ma-overwrite ang save ng
+     ibang account. */
+  if(typeof S !== 'undefined' && S && S.username) return S.username;
+  if(typeof PT_ACCOUNT !== 'undefined' && PT_ACCOUNT && PT_ACCOUNT.username) return PT_ACCOUNT.username;
+  return '';
+}
+function ptSaveGame(force){
+  if(typeof S === 'undefined' || !S) return false;
+  var owner = ptSaveOwner();
+  if(!owner) return false;
+  var now = Date.now();
+  if(!force && now - PT_SAVE_LAST < 2000) return false;
+  PT_SAVE_LAST = now;
+  try{
+    /* Bawat account, sarili niyang key — para hindi mabura ng ibang
+       account sa parehong phone ang save mo. */
+    localStorage.setItem(ptSaveKey(owner), JSON.stringify({ v: 1, username: owner, charName: S.name, savedAt: now, state: S }));
+    return true;
+  }catch(e){ return false; }
+}
+function ptLoadSave(owner){
+  if(!owner) return null;
+  try{
+    var raw = localStorage.getItem(ptSaveKey(owner));
+    if(!raw) return null;
+    var d = JSON.parse(raw);
+    if(!d || !d.state) return null;
+    if(('' + d.username).toLowerCase() !== ('' + owner).toLowerCase()) return null;
+    if(typeof d.state.money !== 'number' || typeof d.state.level !== 'number') return null;
+    return d;
+  }catch(e){ return null; }
+}
+function ptRestoreSave(name){
+  var d = ptLoadSave(ptSaveOwner());
+  if(!d) return false;
+  var keepUser = S.username, keepEmail = S.email;
+  var fresh = freshState(name || d.state.name || 'Manlalaro', S.area || 'Tondo, Manila');
+  var merged = {};
+  var k;
+  for(k in fresh) merged[k] = fresh[k];
+  for(k in d.state) merged[k] = d.state[k];
+  merged.username = keepUser || d.state.username || '';
+  merged.email = keepEmail || d.state.email || '';
+  merged.name = d.state.name || name || merged.name;
+  S = merged;
+  return true;
+}
+var _startGameV38prev = startGame;
+startGame = function(name, area){
+  var wasCharCreate = (typeof CHAR_PENDING !== 'undefined' && !!CHAR_PENDING);
+  _startGameV38prev(name, area);
+  if(!S) return;
+  if(wasCharCreate){ ptSaveGame(true); render(); return; }
+  if(ptRestoreSave(name)){
+    render();
+    addFeed('💾 <b>Naibalik ang progress mo</b> — Level ' + S.level + ', ' + fmt(S.money) + ' ang pera mo. Tuloy ang laro!', 'good');
+  }
+  ptSaveGame(true);
+};
+var _renderV38prev = render;
+render = function(){
+  _renderV38prev();
+  ptSaveGame(false);
+};
+var _logoutV38prev = logout;
+logout = function(){
+  ptSaveGame(true);
+  _logoutV38prev();
+};
+window.addEventListener('pagehide', function(){ ptSaveGame(true); });
+window.addEventListener('beforeunload', function(){ ptSaveGame(true); });
+if(S) render();
+</script>
 </body>
 </html>
