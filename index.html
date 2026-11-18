@@ -1053,6 +1053,7 @@ input,select,textarea{border-radius:5px}
           <button type="button" onclick="goPage('crimes')">⚔ Krimen</button>
           <button type="button" onclick="goPage('gym')">💪 Gym</button>
           <button type="button" onclick="goPage('players')">🥊 Laban</button>
+          <button type="button" onclick="goPage('trade')">💱 Trade</button>
           <button type="button" onclick="randomEvent(true)">🎲 Ganap sa Kanto</button>
           <button type="button" onclick="goPage('travel')">Kalakal — Biyahe</button>
           <button type="button" onclick="goPage('racing')">Karera</button>
@@ -6747,68 +6748,114 @@ if(S) render();
 </script>
 <script>
 /* =====================================================================
-   v38 — LOCAL SAVE (ayaw nang mawala ang progress)
-   - Bakit: dati, bawat login ay S = freshState(...) — Level 1, ₱500 —
-     at walang kahit isang localStorage save ng S. Kaya pag ni-reload,
-     isinara, o na-logout, balik sa simula ang lahat ng laro (krimen,
-     gym, trabaho, casino, items). Ang server ay may saveDb() sa bawat
-     action, pero ang client ay hindi tumatawag sa /api/crimes, /api/gym
-     atbp. — auth, players, leaderboard, chat at trade lang ang live.
-     Kaya ang tunay na progress ay nasa memory lang ng page.
-   - Ayos: bawat render (bawat galaw) ay nagse-save ng S sa
-     localStorage ('pt_save_v1:<username>', sariling key bawat account,
-     max 1x kada 2 segundo), pati sa logout at pagehide. Pag-login ulit,
-     ibinabalik ang save sa halip na fresh state — pero HINDI pag bagong
-     character creation (CHAR_PENDING), para laging simula ang bago.
-   - Tandaan: per-device lang ito (sa phone mo naka-save). Ang tunay na
-     pangmatagalang ayos ay ang server na mismo ang mag-save ng bawat
-     galaw — susunod na hakbang iyon, hindi kasama dito.
+   v39 — SAVE NA HINDI NA BUMABALIK SA SIMULA (tunay na ayos ng v38)
+
+   BAKIT BUMABALIK SA LEVEL 1 / ₱500 KAHIT MAY v38 NA:
+   Ang lumang ayos ay nagse-save sa bawat render(). Pero ang login mismo
+   ay dumadaan sa startGame() -> freshState() -> render() BAGO tumakbo
+   ang restore. Sa sandaling iyon, ang S ay bagong Level 1 / ₱500 pa,
+   kaya ang unang render-save ng login ang nag-overwrite sa totoong
+   save — at ang "restore" pagkatapos ay ang sariwang state na rin ang
+   nabasa. Bawat login, sariling save ang binubura ng laro.
+
+   ANG AYOS DITO:
+   1. PT_SAVE_LOCK — habang nasa loob ng startGame chain ang login,
+      BAWAL mag-save. Ang restore ang mauuna, saka lang magse-save.
+   2. RESTORE sa bawat login (server man o local/offline), maliban sa
+      bagong character creation (CHAR_PENDING) — doon lang legal na
+      magsimula sa Level 1 / ₱500 at i-overwrite ang lumang save.
+   3. ANTI-CLOBBER GUARD — kahit may makalusot na fresh state, hindi ito
+      puwedeng ipalit sa save na may mas mataas na progress.
+   4. BACKUP — bago i-overwrite, ang dating save ay kinokopya sa
+      '<key>:bak'; pag sira ang pangunahing save, ang backup ang babasahin.
+   5. Save sa bawat render (max 1x kada 2 segundo), sa logout, at pag
+      itinago/isinara ang tab (visibilitychange, pagehide, beforeunload).
+
+   Parehong key ang gamit ('pt_save_v1:<username>', bawat account ay
+   sarili) kaya ang save na ginawa ng v38 ay mababasa pa rin dito.
+   Per-device ang save na ito (localStorage ng browser) — tulad ng
+   account at token ng laro na dito na rin naka-save simula pa noon.
 ===================================================================== */
 var PT_SAVE_PREFIX = 'pt_save_v1:';
 var PT_SAVE_LAST = 0;
+var PT_SAVE_LOCK = false;
+var PT_FRESH_OK = false;
 function ptSaveKey(owner){ return PT_SAVE_PREFIX + ('' + owner).toLowerCase(); }
 function ptSaveOwner(){
   /* S.username muna: siya ang may-ari ng state na naka-load ngayon.
      PT_ACCOUNT ay fallback lang — baka iba na ito pag nagpalit ng
-     account bago mag-logout, at ayaw nating ma-overwrite ang save ng
-     ibang account. */
+     account, at ayaw nating ma-overwrite ang save ng ibang account. */
   if(typeof S !== 'undefined' && S && S.username) return S.username;
   if(typeof PT_ACCOUNT !== 'undefined' && PT_ACCOUNT && PT_ACCOUNT.username) return PT_ACCOUNT.username;
   return '';
 }
+function ptSaveScore(st){
+  if(!st) return 0;
+  var items = 0, k;
+  try{
+    if(st.collection) for(k in st.collection) items += st.collection[k] || 0;
+    if(st.owned) items += st.owned.length;
+  }catch(e){}
+  return (st.level || 1) * 1000000000
+    + (st.xp || 0) * 1000000
+    + (st.crimes || 0) * 10000
+    + (st.wins || 0) * 1000
+    + items * 100
+    + Math.min(9999, Math.floor(((st.money || 0) + (st.bank || 0)) / 100));
+}
+function ptSaveIsFresh(st){
+  /* Mukha bang bagong-gawa pa lang ang state na ito (Level 1, ₱500,
+     walang XP, walang krimen, walang gamit, walang trabaho/aral)? */
+  if(!st) return true;
+  return (st.level || 1) <= 1 && (st.day || 1) <= 1 && !(st.xp > 0)
+    && (st.money || 0) === 500 && !(st.bank > 0)
+    && !(st.crimes > 0) && !(st.wins > 0) && !(st.losses > 0) && !st.job
+    && !(st.owned && st.owned.length)
+    && !(st.collection && Object.keys(st.collection).length)
+    && !(st.edu && st.edu.length);
+}
+function ptSaveRead(owner){
+  if(!owner) return null;
+  var keys = [ptSaveKey(owner), ptSaveKey(owner) + ':bak'];
+  for(var i = 0; i < keys.length; i++){
+    try{
+      var raw = localStorage.getItem(keys[i]);
+      if(!raw) continue;
+      var d = JSON.parse(raw);
+      if(!d || !d.state) continue;
+      if(('' + d.username).toLowerCase() !== ('' + owner).toLowerCase()) continue;
+      if(typeof d.state.money !== 'number' || typeof d.state.level !== 'number') continue;
+      return d;
+    }catch(e){}
+  }
+  return null;
+}
 function ptSaveGame(force){
+  if(PT_SAVE_LOCK) return false;
   if(typeof S === 'undefined' || !S) return false;
   var owner = ptSaveOwner();
   if(!owner) return false;
   var now = Date.now();
   if(!force && now - PT_SAVE_LAST < 2000) return false;
+  if(!PT_FRESH_OK && ptSaveIsFresh(S)){
+    /* Huwag hayaang burahin ng bagong state ang save na may progress. */
+    var existing = ptSaveRead(owner);
+    if(existing && ptSaveScore(existing.state) > ptSaveScore(S)) return false;
+  }
   PT_SAVE_LAST = now;
   try{
-    /* Bawat account, sarili niyang key — para hindi mabura ng ibang
-       account sa parehong phone ang save mo. */
+    var rawPrev = localStorage.getItem(ptSaveKey(owner));
+    if(rawPrev){ try{ localStorage.setItem(ptSaveKey(owner) + ':bak', rawPrev); }catch(e){} }
     localStorage.setItem(ptSaveKey(owner), JSON.stringify({ v: 1, username: owner, charName: S.name, savedAt: now, state: S }));
     return true;
   }catch(e){ return false; }
 }
-function ptLoadSave(owner){
-  if(!owner) return null;
-  try{
-    var raw = localStorage.getItem(ptSaveKey(owner));
-    if(!raw) return null;
-    var d = JSON.parse(raw);
-    if(!d || !d.state) return null;
-    if(('' + d.username).toLowerCase() !== ('' + owner).toLowerCase()) return null;
-    if(typeof d.state.money !== 'number' || typeof d.state.level !== 'number') return null;
-    return d;
-  }catch(e){ return null; }
-}
 function ptRestoreSave(name){
-  var d = ptLoadSave(ptSaveOwner());
+  var d = ptSaveRead(ptSaveOwner());
   if(!d) return false;
   var keepUser = S.username, keepEmail = S.email;
   var fresh = freshState(name || d.state.name || 'Manlalaro', S.area || 'Tondo, Manila');
-  var merged = {};
-  var k;
+  var merged = {}, k;
   for(k in fresh) merged[k] = fresh[k];
   for(k in d.state) merged[k] = d.state[k];
   merged.username = keepUser || d.state.username || '';
@@ -6817,28 +6864,38 @@ function ptRestoreSave(name){
   S = merged;
   return true;
 }
-var _startGameV38prev = startGame;
+var _startGameV39prev = startGame;
 startGame = function(name, area){
   var wasCharCreate = (typeof CHAR_PENDING !== 'undefined' && !!CHAR_PENDING);
-  _startGameV38prev(name, area);
+  PT_SAVE_LOCK = true;              /* bawal mag-save habang fresh pa ang S */
+  _startGameV39prev(name, area);
+  PT_SAVE_LOCK = false;
   if(!S) return;
-  if(wasCharCreate){ ptSaveGame(true); render(); return; }
+  if(wasCharCreate){
+    /* Bagong character: legal na magsimula sa simula at ito ang i-save. */
+    PT_FRESH_OK = true;
+    ptSaveGame(true);
+    PT_FRESH_OK = false;
+    render();
+    return;
+  }
   if(ptRestoreSave(name)){
     render();
     addFeed('💾 <b>Naibalik ang progress mo</b> — Level ' + S.level + ', ' + fmt(S.money) + ' ang pera mo. Tuloy ang laro!', 'good');
   }
   ptSaveGame(true);
 };
-var _renderV38prev = render;
+var _renderV39prev = render;
 render = function(){
-  _renderV38prev();
+  _renderV39prev();
   ptSaveGame(false);
 };
-var _logoutV38prev = logout;
+var _logoutV39prev = logout;
 logout = function(){
   ptSaveGame(true);
-  _logoutV38prev();
+  _logoutV39prev();
 };
+document.addEventListener('visibilitychange', function(){ if(document.visibilityState === 'hidden') ptSaveGame(true); });
 window.addEventListener('pagehide', function(){ ptSaveGame(true); });
 window.addEventListener('beforeunload', function(){ ptSaveGame(true); });
 if(S) render();
